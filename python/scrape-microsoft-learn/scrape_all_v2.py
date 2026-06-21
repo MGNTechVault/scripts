@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Microsoft Learn Scraper v2 — downloads learning paths as Markdown, DOCX, or TXT.
+"""Microsoft Learn Scraper v2 — downloads learning paths as Markdown, DOCX, TXT, or PDF.
 
 Author:  Matthew Gonzalez Nieves
 Version: 1.0.0
@@ -19,12 +19,18 @@ Usage:
     python scrape_all_v2.py --format markdown       # required flag
     python scrape_all_v2.py --format docx
     python scrape_all_v2.py --format txt
+    python scrape_all_v2.py --format pdf
     python scrape_all_v2.py                         # interactive choice if --format is omitted
+    python scrape_all_v2.py --pick                  # interactive learning-path picker
+    python scrape_all_v2.py --locale nl-nl          # picker catalog locale (default en-us)
     python scrape_all_v2.py --config custom.yaml    # use a different config file
     python scrape_all_v2.py --urls URL1 URL2        # override URLs via CLI
     python scrape_all_v2.py --output filename       # override output name (extension auto-determined)
     python scrape_all_v2.py --headed                # show browser window
     python scrape_all_v2.py -v                      # verbose logging
+
+    When neither --urls nor config paths are given, an interactive picker lists
+    every current Microsoft Learn learning path so you can select one or more.
 
 Requirements:
     pip install playwright pyyaml python-docx
@@ -32,6 +38,7 @@ Requirements:
 """
 
 import argparse
+import json
 import logging
 import re
 import sys
@@ -46,8 +53,19 @@ from playwright.sync_api import sync_playwright, Page, TimeoutError as PwTimeout
 
 logger = logging.getLogger(__name__)
 
-VALID_FORMATS = ("markdown", "docx", "txt")
-FORMAT_EXTENSIONS = {"markdown": ".md", "docx": ".docx", "txt": ".txt"}
+VALID_FORMATS = ("markdown", "docx", "txt", "pdf")
+FORMAT_EXTENSIONS = {"markdown": ".md", "docx": ".docx", "txt": ".txt", "pdf": ".pdf"}
+
+# Browser user-agent reused for scraping and the catalog fetch.
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+
+# Microsoft Learn public catalog API — lists every learning path with its URL.
+CATALOG_API = "https://learn.microsoft.com/api/catalog/?type=learningPaths&locale={locale}"
+DEFAULT_LOCALE = "en-us"
+PICKER_RESULT_LIMIT = 40
 
 # --- Selectors (centralised so changes only need to happen in one place) ---
 CONTENT_SELECTOR = "#unit-inner-section"
@@ -460,6 +478,86 @@ def write_docx(
     logger.info("DOCX written to %s", output)
 
 
+PDF_STYLE = """
+    body { font-family: -apple-system, Segoe UI, Helvetica, Arial, sans-serif;
+           font-size: 11pt; line-height: 1.5; color: #1b1b1b; margin: 2em; }
+    h1 { font-size: 22pt; border-bottom: 2px solid #0067b8; padding-bottom: .2em; }
+    h2 { font-size: 17pt; color: #0067b8; margin-top: 1.4em;
+         page-break-before: always; }
+    h2:first-of-type { page-break-before: avoid; }
+    h3 { font-size: 14pt; margin-top: 1em; }
+    h4 { font-size: 12pt; margin-top: .8em; color: #333; }
+    .meta { color: #666; font-size: 9pt; }
+    .source { color: #666; font-size: 9pt; word-break: break-all; }
+    .toc a, .content { color: inherit; }
+    pre { white-space: pre-wrap; font-family: inherit; }
+    hr { border: none; border-top: 1px solid #ddd; margin: 1em 0; }
+"""
+
+
+def _html_escape(text: str) -> str:
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def _render_html(paths: list[LearningPath], title: str) -> str:
+    """Build a single self-contained HTML document for PDF rendering."""
+    out: list[str] = [
+        "<!DOCTYPE html><html><head><meta charset='utf-8'>",
+        f"<title>{_html_escape(title)}</title>",
+        f"<style>{PDF_STYLE}</style></head><body>",
+        f"<h1>{_html_escape(title)}</h1>",
+        f"<p class='meta'>Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}</p>",
+        "<h2 style='page-break-before:avoid'>Table of Contents</h2><ul class='toc'>",
+    ]
+    for lp in paths:
+        out.append(f"<li><strong>{_html_escape(lp.title)}</strong><ul>")
+        for mod in lp.modules:
+            out.append(
+                f"<li>{_html_escape(mod.title)} ({len(mod.units)} lessons)</li>"
+            )
+        out.append("</ul></li>")
+    out.append("</ul>")
+
+    for lp in paths:
+        out.append(f"<h2>{_html_escape(lp.title)}</h2>")
+        out.append(f"<p class='source'>Source: {_html_escape(lp.url)}</p>")
+        for mod in lp.modules:
+            out.append(f"<h3>{_html_escape(mod.title)}</h3>")
+            for unit in mod.units:
+                out.append(f"<h4>{_html_escape(unit.title)}</h4>")
+                out.append(f"<pre class='content'>{_html_escape(unit.content)}</pre>")
+                out.append("<hr>")
+    out.append("</body></html>")
+    return "".join(out)
+
+
+def write_pdf(
+    paths: list[LearningPath],
+    output: Path,
+    title: str = "AZ-305 Course Material",
+) -> None:
+    """Write to PDF (.pdf) by rendering HTML in headless Chromium."""
+    html = _render_html(paths, title)
+    tmp = output.with_suffix(".tmp")
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+        page.set_content(html, wait_until="load")
+        page.pdf(
+            path=str(tmp),
+            format="A4",
+            print_background=True,
+            margin={"top": "1.5cm", "bottom": "1.5cm", "left": "1.2cm", "right": "1.2cm"},
+        )
+        browser.close()
+    tmp.replace(output)
+    logger.info("PDF written to %s", output)
+
+
 def write_output(
     paths: list[LearningPath],
     output: Path,
@@ -471,6 +569,7 @@ def write_output(
         "markdown": write_markdown,
         "txt": write_txt,
         "docx": write_docx,
+        "pdf": write_pdf,
     }
     writers[fmt](paths, output, title)
 
@@ -488,20 +587,145 @@ def load_config(path: str) -> dict:
         return {}
 
 
+# ── Learning path picker ──────────────────────────────────────
+
+
+def fetch_learning_paths(locale: str = DEFAULT_LOCALE) -> list[dict]:
+    """Fetch every learning path from the Microsoft Learn catalog API.
+
+    Uses a real headless Chromium page because a plain HTTP request is blocked
+    (HTTP 403) by Microsoft Learn's bot protection.
+    """
+    url = CATALOG_API.format(locale=locale)
+    logger.info("Fetching learning path catalog (%s)…", locale)
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(user_agent=USER_AGENT)
+        page = context.new_page()
+        try:
+            if not safe_goto(page, url):
+                return []
+            raw = page.evaluate("() => document.body.innerText")
+        finally:
+            browser.close()
+
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        logger.error("Could not parse catalog response as JSON.")
+        return []
+
+    paths = data.get("learningPaths", [])
+    paths.sort(key=lambda lp: (lp.get("title") or "").lower())
+    logger.info("Catalog loaded: %d learning paths available.", len(paths))
+    return paths
+
+
+def pick_learning_paths(paths: list[dict]) -> tuple[list[str], str | None]:
+    """Interactively let the user search and select one or more learning paths.
+
+    Returns the selected URLs and the title of the first selection (used as a
+    default document title). Returns ([], None) if the user cancels.
+    """
+    if not paths:
+        print("\nNo learning paths could be retrieved from the catalog.")
+        return [], None
+
+    print()
+    print("Learning path picker")
+    print("=" * 42)
+    print(f"{len(paths)} learning paths available.")
+
+    def _ask(prompt: str) -> str:
+        try:
+            return input(prompt).strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nCancelled.")
+            raise SystemExit(0)
+
+    while True:
+        term = _ask(
+            "\nSearch by keyword (e.g. 'azure fundamentals'), or Enter to list all: "
+        ).lower()
+
+        if term:
+            matches = [
+                lp for lp in paths
+                if term in (lp.get("title") or "").lower()
+                or term in (lp.get("summary") or "").lower()
+            ]
+        else:
+            matches = paths
+
+        if not matches:
+            print(f"  No learning paths match '{term}'. Try another keyword.")
+            continue
+
+        if len(matches) > PICKER_RESULT_LIMIT:
+            print(
+                f"  {len(matches)} matches — showing first {PICKER_RESULT_LIMIT}. "
+                "Refine your keyword to narrow the list."
+            )
+            shown = matches[:PICKER_RESULT_LIMIT]
+        else:
+            shown = matches
+
+        print()
+        for idx, lp in enumerate(shown, 1):
+            print(f"  {idx:>3}  {lp.get('title', '(untitled)')}")
+        print()
+
+        choice = _ask(
+            "Enter number(s) to select (comma-separated), "
+            "or 's' to search again, 'q' to quit: "
+        ).lower()
+
+        if choice in ("q", "quit"):
+            print("Cancelled.")
+            return [], None
+        if choice in ("", "s", "search"):
+            continue
+
+        try:
+            indices = [int(c) for c in choice.replace(" ", "").split(",") if c]
+        except ValueError:
+            print("  Invalid input — enter numbers like '1' or '1,3,5'.")
+            continue
+
+        selected = [shown[i - 1] for i in indices if 1 <= i <= len(shown)]
+        if not selected:
+            print("  No valid numbers in range — try again.")
+            continue
+
+        urls = [lp["url"] for lp in selected if lp.get("url")]
+        if not urls:
+            print("  Selected paths have no usable URL — try again.")
+            continue
+
+        print("\n-> Selected:")
+        for lp in selected:
+            print(f"     • {lp.get('title')}")
+        print()
+        return urls, selected[0].get("title")
+
+
 def ask_format_interactively() -> str:
     """Ask the user interactively for an output format when --format is not provided."""
-    options = {"1": "markdown", "2": "docx", "3": "txt"}
+    options = {"1": "markdown", "2": "docx", "3": "txt", "4": "pdf"}
     print()
     print("Choose an output format")
     print("=" * 42)
     print("  1  ->  Markdown  (.md)")
     print("  2  ->  Word      (.docx)")
     print("  3  ->  Plain text (.txt)")
+    print("  4  ->  PDF       (.pdf)")
     print()
 
     while True:
         try:
-            choice = input("Enter 1, 2 or 3 (or type 'markdown', 'docx', 'txt'): ").strip().lower()
+            choice = input(
+                "Enter 1, 2, 3 or 4 (or type 'markdown', 'docx', 'txt', 'pdf'): "
+            ).strip().lower()
         except (EOFError, KeyboardInterrupt):
             print("\nCancelled.")
             raise SystemExit(0)
@@ -515,7 +739,7 @@ def ask_format_interactively() -> str:
             print(f"-> Selected format: {choice}\n")
             return choice
 
-        print(f"  Invalid choice '{choice}'. Choose 1, 2, 3 or type the format name.")
+        print(f"  Invalid choice '{choice}'. Choose 1, 2, 3, 4 or type the format name.")
 
 
 def resolve_format(raw: str | None) -> str:
@@ -529,7 +753,8 @@ def resolve_format(raw: str | None) -> str:
             f"Choose one of: {', '.join(VALID_FORMATS)}\n\n"
             f"Usage:  python scrape_all_v2.py --format markdown\n"
             f"        python scrape_all_v2.py --format docx\n"
-            f"        python scrape_all_v2.py --format txt\n",
+            f"        python scrape_all_v2.py --format txt\n"
+            f"        python scrape_all_v2.py --format pdf\n",
             file=sys.stderr,
         )
         raise SystemExit(1)
@@ -539,14 +764,16 @@ def resolve_format(raw: str | None) -> str:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=(
-            "Microsoft Learn Scraper — downloads learning paths as Markdown, DOCX, or TXT.\n\n"
-            "  --format is required. If omitted you will be prompted interactively."
+            "Microsoft Learn Scraper — downloads learning paths as Markdown, DOCX, TXT, or PDF.\n\n"
+            "  --format is required. If omitted you will be prompted interactively.\n"
+            "  When no URLs are given, an interactive learning-path picker is shown."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  python scrape_all_v2.py --format markdown\n"
-            "  python scrape_all_v2.py --format docx --output MyCourse\n"
+            "  python scrape_all_v2.py --format markdown            # pick path(s) interactively\n"
+            "  python scrape_all_v2.py --format pdf --pick           # force the picker\n"
+            "  python scrape_all_v2.py --format docx --output MyCourse --urls URL\n"
             "  python scrape_all_v2.py --format txt --config other.yaml -v\n"
         ),
     )
@@ -559,6 +786,17 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--config", default="config.yaml", help="YAML config file (default: config.yaml)")
     p.add_argument("--urls", nargs="+", help="Learning path URLs (overrides config)")
+    p.add_argument(
+        "--pick",
+        action="store_true",
+        help="Pick learning paths interactively from the Microsoft Learn catalog "
+             "(runs automatically when no URLs are provided)",
+    )
+    p.add_argument(
+        "--locale",
+        default=DEFAULT_LOCALE,
+        help=f"Catalog locale for the picker (default: {DEFAULT_LOCALE}, e.g. nl-nl)",
+    )
     p.add_argument("--output", help="Output filename without extension, or full path (extension is auto-determined)")
     p.add_argument("--title", help="Title of the output document")
     p.add_argument("--headed", action="store_true", help="Show the browser window (for debugging)")
@@ -589,13 +827,20 @@ def main() -> None:
     urls = args.urls or cfg.get("paths", [])
     title = args.title or cfg.get("title", "AZ-305 Course Material")
 
+    # ── No URLs (or --pick): let the user choose from the live catalog ────
+    if args.pick or not urls:
+        catalog = fetch_learning_paths(args.locale)
+        urls, picked_title = pick_learning_paths(catalog)
+        if not urls:
+            logger.info("No learning paths selected — nothing to do.")
+            raise SystemExit(0)
+        # Use the picked path's title as the document title unless one was set.
+        if not args.title and not cfg.get("title") and picked_title:
+            title = picked_title
+
     # Determine output filename — extension always follows the format
     raw_output = args.output or cfg.get("output", "output")
     output_path = Path(raw_output).with_suffix(FORMAT_EXTENSIONS[fmt])
-
-    if not urls:
-        logger.error("No URLs provided via --urls or %s", args.config)
-        raise SystemExit(1)
 
     logger.info(
         "Starting scraper — format: %s | %d learning paths | output: %s",
@@ -607,12 +852,7 @@ def main() -> None:
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=not args.headed)
-        context = browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            )
-        )
+        context = browser.new_context(user_agent=USER_AGENT)
         page = context.new_page()
 
         # Handle cookie banner on first navigation
