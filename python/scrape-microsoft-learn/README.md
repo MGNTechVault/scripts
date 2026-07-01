@@ -116,6 +116,10 @@ The script generates:
 
 Supported formats preserve structure and content from Microsoft Learn.
 
+**PDF** additionally preserves the inline images (diagrams and screenshots) from
+the Learn pages — the other formats are text-only. Because the images are embedded,
+PDF files are noticeably larger than the equivalent Markdown/DOCX/TXT export.
+
 ## Notes
 
 - Respects page load times and cookie banners

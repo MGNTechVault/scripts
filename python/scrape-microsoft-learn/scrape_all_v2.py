@@ -94,6 +94,7 @@ class Unit:
     title: str
     url: str
     content: str
+    content_html: str | None = None   # only used by the PDF writer
 
 
 @dataclass
@@ -185,23 +186,94 @@ def dismiss_cookie_banner(page: Page) -> None:
             continue
 
 
-def extract_content(page: Page) -> str | None:
-    """Extract content via a DOM clone — does not mutate the original."""
+def extract_content(page: Page) -> tuple[str, str | None] | None:
+    """Extract content via a DOM clone — does not mutate the original.
+
+    Returns (plain_text, sanitized_html). plain_text keeps the previous
+    behaviour exactly (gated by MIN_CONTENT_LENGTH, run through clean_text);
+    sanitized_html is a best-effort fragment with absolute image URLs used
+    only by the PDF renderer, or None if nothing usable was produced.
+    """
     noise_css = ", ".join(NOISE_SELECTORS)
     result = page.evaluate(
         """([contentSel, fallbackSel, noiseSel]) => {
             const el = document.querySelector(contentSel)
                     || document.querySelector(fallbackSel);
             if (!el) return null;
+
             const clone = el.cloneNode(true);
+
+            // 1. Remove existing noise (buttons, nav, etc.) — unchanged set.
             clone.querySelectorAll(noiseSel).forEach(e => e.remove());
-            return clone.innerText.trim();
+
+            // 2. Remove elements that must never reach the PDF.
+            clone.querySelectorAll('script, style, iframe, noscript, template, object, embed')
+                 .forEach(e => e.remove());
+
+            // 3. Plain text — identical to the previous behaviour.
+            const text = clone.innerText.trim();
+
+            // 4. Resolve <img> to absolute URLs; handle lazy-load / srcset.
+            clone.querySelectorAll('img').forEach(img => {
+                let src = img.getAttribute('src') || '';
+                const dataSrc = img.getAttribute('data-src')
+                             || img.getAttribute('data-lazy-src')
+                             || img.getAttribute('data-original') || '';
+                const isPlaceholder = !src
+                    || src.startsWith('data:image/gif')
+                    || src.startsWith('data:image/svg')
+                    || /\\bplaceholder\\b/i.test(src);
+                if (dataSrc && (isPlaceholder || img.loading === 'lazy')) {
+                    src = dataSrc;
+                }
+                if (!src) {
+                    const ss = img.getAttribute('srcset')
+                            || img.getAttribute('data-srcset') || '';
+                    if (ss) src = ss.split(',')[0].trim().split(/\\s+/)[0];
+                }
+                if (src) {
+                    try { img.setAttribute('src', new URL(src, document.baseURI).href); }
+                    catch (e) { /* leave as-is if it will not parse */ }
+                }
+                img.removeAttribute('srcset');
+                img.removeAttribute('data-src');
+                img.removeAttribute('data-srcset');
+                img.removeAttribute('loading');
+                img.removeAttribute('width');
+                img.removeAttribute('height');
+                img.removeAttribute('style');
+            });
+
+            // 5. Resolve <a href> to absolute; strip javascript: links.
+            clone.querySelectorAll('a[href]').forEach(a => {
+                const href = a.getAttribute('href') || '';
+                if (/^\\s*javascript:/i.test(href)) { a.removeAttribute('href'); return; }
+                try { a.setAttribute('href', new URL(href, document.baseURI).href); }
+                catch (e) { a.removeAttribute('href'); }
+            });
+
+            // 6. Strip inline event handlers and any javascript: in src/href.
+            clone.querySelectorAll('*').forEach(node => {
+                for (const attr of Array.from(node.attributes)) {
+                    const name = attr.name.toLowerCase();
+                    if (name.startsWith('on')) { node.removeAttribute(attr.name); continue; }
+                    if ((name === 'src' || name === 'href')
+                        && /^\\s*javascript:/i.test(attr.value)) {
+                        node.removeAttribute(attr.name);
+                    }
+                }
+            });
+
+            return { text: text, html: clone.innerHTML };
         }""",
         [CONTENT_SELECTOR, FALLBACK_CONTENT_SELECTOR, noise_css],
     )
-    if result and len(result) > MIN_CONTENT_LENGTH:
-        return clean_text(result)
-    return None
+    if not result:
+        return None
+    text = result.get("text") or ""
+    if len(text) <= MIN_CONTENT_LENGTH:
+        return None
+    return clean_text(text), result.get("html")
 
 
 # ── URL extraction ────────────────────────────────────────────
@@ -265,12 +337,13 @@ def scrape_unit(page: Page, url: str) -> Unit | None:
 
     h1 = page.query_selector("h1")
     title = h1.inner_text().strip() if h1 else "Unknown lesson"
-    content = extract_content(page)
+    extracted = extract_content(page)
 
-    if not content:
+    if not extracted:
         logger.info("  No usable content: %s", url)
         return None
-    return Unit(title=title, url=url, content=content)
+    content, content_html = extracted
+    return Unit(title=title, url=url, content=content, content_html=content_html)
 
 
 def scrape_module(page: Page, url: str, stats: ScrapeStats, seen_urls: set[str]) -> Module | None:
@@ -497,6 +570,30 @@ PDF_STYLE = """
     .toc a, .content { color: inherit; }
     pre { white-space: pre-wrap; font-family: inherit; }
     hr { border: none; border-top: 1px solid #ddd; margin: 1em 0; }
+    /* image + rich-content support for the PDF path */
+    /* Normalise headings inside injected content so they act as sub-headings
+       and never inherit the document chrome (big blue h2 + forced page breaks). */
+    .content h1, .content h2, .content h3, .content h4, .content h5, .content h6 {
+        page-break-before: auto; border-bottom: none; }
+    .content h1 { font-size: 15pt; color: #1b1b1b; margin-top: 1em; }
+    .content h2 { font-size: 13pt; color: #1b1b1b; margin-top: .9em; }
+    .content h3 { font-size: 12pt; color: #333; margin-top: .8em; }
+    .content h4, .content h5, .content h6 { font-size: 11pt; color: #333; margin-top: .7em; }
+    .content img { max-width: 100%; height: auto; display: block;
+                   margin: 0.6em 0; page-break-inside: avoid; }
+    figure { margin: 0.8em 0; page-break-inside: avoid; }
+    figcaption { font-size: 9pt; color: #666; font-style: italic; margin-top: .3em; }
+    .content table { border-collapse: collapse; width: 100%; margin: 0.8em 0;
+                     font-size: 10pt; page-break-inside: avoid; }
+    .content th, .content td { border: 1px solid #ccc; padding: 4px 8px;
+                               text-align: left; vertical-align: top; }
+    .content th { background: #f3f3f3; }
+    .content code { font-family: SFMono-Regular, Consolas, monospace; font-size: 10pt;
+                    background: #f5f5f5; padding: 1px 4px; border-radius: 3px; }
+    .content pre { background: #f5f5f5; padding: .8em; border-radius: 4px;
+                   white-space: pre-wrap; page-break-inside: avoid; }
+    .content ul, .content ol { margin: .5em 0 .5em 1.4em; }
+    .content a { color: #0067b8; text-decoration: none; word-break: break-word; }
 """
 
 
@@ -534,7 +631,12 @@ def _render_html(paths: list[LearningPath], title: str) -> str:
             out.append(f"<h3>{_html_escape(mod.title)}</h3>")
             for unit in mod.units:
                 out.append(f"<h4>{_html_escape(unit.title)}</h4>")
-                out.append(f"<pre class='content'>{_html_escape(unit.content)}</pre>")
+                if unit.content_html:
+                    # Fragment was sanitized at scrape time (no scripts/handlers),
+                    # so it is injected unescaped to carry images/tables/links.
+                    out.append(f"<div class='content'>{unit.content_html}</div>")
+                else:
+                    out.append(f"<pre class='content'>{_html_escape(unit.content)}</pre>")
                 out.append("<hr>")
     out.append("</body></html>")
     return "".join(out)
@@ -545,13 +647,32 @@ def write_pdf(
     output: Path,
     title: str = "AZ-305 Course Material",
 ) -> None:
-    """Write to PDF (.pdf) by rendering HTML in headless Chromium."""
+    """Write to PDF (.pdf) by rendering HTML in headless Chromium.
+
+    Images captured at scrape time are embedded by letting Chromium fetch the
+    absolute image URLs during rendering. Absolute URLs are already baked into
+    the HTML, so no base URL is needed. All image waits are bounded so a slow
+    or broken image can never hang the export.
+    """
     html = _render_html(paths, title)
     tmp = output.with_suffix(".tmp")
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
-        page.set_content(html, wait_until="load")
+        try:
+            page.set_content(html, wait_until="networkidle", timeout=45_000)
+        except PwTimeout:
+            logger.warning("PDF render: networkidle timed out, continuing anyway")
+            page.set_content(html, wait_until="load", timeout=15_000)
+        try:
+            # Broken/403 images still resolve to complete=true, so the predicate
+            # passes; the timeout guards against a request that never returns.
+            page.wait_for_function(
+                "() => Array.from(document.images).every(img => img.complete)",
+                timeout=20_000,
+            )
+        except PwTimeout:
+            logger.warning("PDF render: some images did not finish loading; emitting PDF anyway")
         page.pdf(
             path=str(tmp),
             format="A4",
@@ -870,7 +991,9 @@ def ask_format_interactively() -> str:
     print("  1  ->  Markdown  (.md)")
     print("  2  ->  Word      (.docx)")
     print("  3  ->  Plain text (.txt)")
-    print("  4  ->  PDF       (.pdf)")
+    print("  4  ->  PDF       (.pdf)   (includes images — larger file size)")
+    print()
+    print("  Note: PDF embeds page images, so PDF files are larger than the other formats.")
     print()
 
     while True:
