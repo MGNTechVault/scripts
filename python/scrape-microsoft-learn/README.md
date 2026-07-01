@@ -8,7 +8,7 @@
 
 Download Microsoft Learn training paths and convert them to Markdown, DOCX, TXT, or PDF files.
 
-Don't know the URL? Skip it — an interactive **learning path picker** lists every current Microsoft Learn learning path so you can search and select one or more.
+Don't know the URL? Skip it — a **source menu** lets you choose between the live Microsoft Learn catalog (search & pick any learning path, or a whole **course** like MD-102 that bundles several paths) or the paths saved in `config.yaml`.
 
 Intended for personal offline study using AI tools such as **Microsoft Copilot Notebook** and **Google NotebookLM** — export your learning paths and feed them directly to your AI notebook for smarter studying.
 
@@ -36,18 +36,41 @@ python scrape_all_v2.py --format txt
 python scrape_all_v2.py --format pdf
 ```
 
-### Learning path picker
+### Source menu
 
-When you run the scraper **without** providing URLs (no `--urls` and no `paths`
-in `config.yaml`), it fetches the full Microsoft Learn catalog and shows an
-interactive picker:
+When you run the scraper **without** `--urls`, a TUI menu asks where the
+content should come from:
 
-```bash
-python scrape_all_v2.py --format pdf          # no URLs -> picker opens
-python scrape_all_v2.py --format markdown --pick   # force the picker
+```
+Where should the content come from?
+==========================================
+  1  ->  Live learning paths  (search & pick individual paths)
+  2  ->  Live courses         (exam-style, bundles paths, e.g. MD-102)
+  3  ->  Config file          (config.yaml, 6 path(s))
 ```
 
-In the picker you can:
+```bash
+python scrape_all_v2.py --format pdf                # no URLs -> source menu opens
+python scrape_all_v2.py --format markdown --pick    # skip menu, force learning-path picker
+python scrape_all_v2.py --format pdf --courses      # skip menu, force course picker
+```
+
+- **1 — Live learning paths**: fetches the catalog and opens the picker (below).
+- **2 — Live courses**: lists all 150+ Microsoft Learn courses. A course (e.g.
+  MD-102) has no lessons of its own — it bundles several learning paths/modules,
+  which are all scraped into one document. Each entry shows its **course number**
+  and how many paths it expands to, e.g. `MD-102T00 — Microsoft 365 Endpoint
+  Administrator  (8 paths/modules)`. The course number becomes the document
+  title and the **output filename** (e.g. `MD-102T00.pdf`) unless you pass
+  `--output`. Courses without a number fall back to a slug of the title.
+- **3 — Config file**: uses the `paths` from `config.yaml` (only offered when the file has paths).
+
+`--pick` / `--courses` skip the menu. In a non-interactive session (cron/pipe)
+the menu is skipped and the config paths are used.
+
+### Picker
+
+When you pick from the live catalog (paths or courses) you get an interactive picker. In it you can:
 - Type a keyword (e.g. `azure fundamentals`) to filter by title/summary
 - Select one **or more** paths with comma-separated numbers (e.g. `1,3,5`)
 - Use a different catalog language with `--locale` (default `en-us`, e.g. `--locale nl-nl`)
@@ -75,7 +98,8 @@ python scrape_all_v2.py --format docx --urls URL1 URL2 URL3
 - `--format` — Output format: markdown, docx, txt, or pdf (required)
 - `--config` — Path to config file (default: config.yaml)
 - `--urls` — Override URLs from command line
-- `--pick` — Pick learning paths interactively from the catalog (auto when no URLs)
+- `--pick` — Skip the source menu and go straight to the live learning-path picker
+- `--courses` — Skip the source menu and go straight to the live course picker (bundles paths, e.g. MD-102)
 - `--locale` — Catalog locale for the picker (default: en-us, e.g. nl-nl)
 - `--output` — Output filename without extension
 - `--title` — Document title
