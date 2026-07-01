@@ -22,6 +22,7 @@ Usage:
     python scrape_all_v2.py --format pdf
     python scrape_all_v2.py                         # interactive choice if --format is omitted
     python scrape_all_v2.py --pick                  # interactive learning-path picker
+    python scrape_all_v2.py --courses               # interactive course picker (e.g. MD-102)
     python scrape_all_v2.py --locale nl-nl          # picker catalog locale (default en-us)
     python scrape_all_v2.py --config custom.yaml    # use a different config file
     python scrape_all_v2.py --urls URL1 URL2        # override URLs via CLI
@@ -29,8 +30,10 @@ Usage:
     python scrape_all_v2.py --headed                # show browser window
     python scrape_all_v2.py -v                      # verbose logging
 
-    When neither --urls nor config paths are given, an interactive picker lists
-    every current Microsoft Learn learning path so you can select one or more.
+    Without --urls (and without --pick/--courses), an interactive menu asks
+    whether to pick from the live Microsoft Learn catalog — individual learning
+    paths or a whole course (which bundles several paths) — or use the paths
+    from config.yaml.
 
 Requirements:
     pip install playwright pyyaml python-docx
@@ -62,10 +65,12 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 
-# Microsoft Learn public catalog API — lists every learning path with its URL.
-CATALOG_API = "https://learn.microsoft.com/api/catalog/?type=learningPaths&locale={locale}"
+# Microsoft Learn public catalog API — lists learning paths, courses, modules…
+CATALOG_API = "https://learn.microsoft.com/api/catalog/?type={types}&locale={locale}"
 DEFAULT_LOCALE = "en-us"
 PICKER_RESULT_LIMIT = 40
+# Maps a catalog study_guide entry type to the scrape kind used internally.
+STUDY_GUIDE_KINDS = {"learningPath": "path", "module": "module"}
 
 # --- Selectors (centralised so changes only need to happen in one place) ---
 CONTENT_SELECTOR = "#unit-inner-section"
@@ -587,54 +592,112 @@ def load_config(path: str) -> dict:
         return {}
 
 
-# ── Learning path picker ──────────────────────────────────────
+# ── Catalog fetch & picker ────────────────────────────────────
 
 
-def fetch_learning_paths(locale: str = DEFAULT_LOCALE) -> list[dict]:
-    """Fetch every learning path from the Microsoft Learn catalog API.
+def _as_path_targets(urls: list[str]) -> list[dict]:
+    """Wrap plain learning-path URLs as scrape targets."""
+    return [{"url": u, "kind": "path"} for u in urls]
+
+
+def _slugify(text: str) -> str:
+    """Turn arbitrary text into a filesystem-safe basename."""
+    slug = re.sub(r"[^\w\-]+", "-", (text or "").strip()).strip("-")
+    return slug or "output"
+
+
+def _fetch_catalog_raw(types: str, locale: str) -> dict:
+    """Fetch raw catalog JSON for the given comma-separated catalog types.
 
     Uses a real headless Chromium page because a plain HTTP request is blocked
     (HTTP 403) by Microsoft Learn's bot protection.
     """
-    url = CATALOG_API.format(locale=locale)
-    logger.info("Fetching learning path catalog (%s)…", locale)
+    url = CATALOG_API.format(types=types, locale=locale)
+    logger.info("Fetching catalog (%s, %s)…", types, locale)
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(user_agent=USER_AGENT)
         page = context.new_page()
         try:
             if not safe_goto(page, url):
-                return []
+                return {}
             raw = page.evaluate("() => document.body.innerText")
         finally:
             browser.close()
 
     try:
-        data = json.loads(raw)
+        return json.loads(raw)
     except (json.JSONDecodeError, TypeError):
         logger.error("Could not parse catalog response as JSON.")
-        return []
+        return {}
 
+
+def fetch_learning_paths(locale: str = DEFAULT_LOCALE) -> list[dict]:
+    """Fetch every learning path from the Microsoft Learn catalog API."""
+    data = _fetch_catalog_raw("learningPaths", locale)
     paths = data.get("learningPaths", [])
     paths.sort(key=lambda lp: (lp.get("title") or "").lower())
     logger.info("Catalog loaded: %d learning paths available.", len(paths))
     return paths
 
 
-def pick_learning_paths(paths: list[dict]) -> tuple[list[str], str | None]:
-    """Interactively let the user search and select one or more learning paths.
+def fetch_courses(locale: str = DEFAULT_LOCALE) -> list[dict]:
+    """Fetch every course plus the learning paths/modules they reference.
 
-    Returns the selected URLs and the title of the first selection (used as a
-    default document title). Returns ([], None) if the user cancels.
+    A course has no lessons of its own — its ``study_guide`` references learning
+    paths and modules by uid. We fetch those alongside the courses in one call
+    and attach a resolved ``targets`` list ([{url, kind}]) to each course so the
+    scraper knows exactly what to download.
     """
-    if not paths:
-        print("\nNo learning paths could be retrieved from the catalog.")
-        return [], None
+    data = _fetch_catalog_raw("courses,learningPaths,modules", locale)
+    courses = data.get("courses", [])
+    uid_to_url = {
+        item["uid"]: item.get("url")
+        for item in data.get("learningPaths", []) + data.get("modules", [])
+        if item.get("uid")
+    }
+    for course in courses:
+        targets = []
+        for entry in course.get("study_guide") or []:
+            url = uid_to_url.get(entry.get("uid"))
+            kind = STUDY_GUIDE_KINDS.get(entry.get("type"))
+            if url and kind:
+                targets.append({"url": url, "kind": kind})
+        course["targets"] = targets
+    courses.sort(key=lambda c: (c.get("title") or "").lower())
+    logger.info("Catalog loaded: %d courses available.", len(courses))
+    return courses
+
+
+def _select_from_catalog(
+    items: list[dict],
+    *,
+    noun: str,
+    label_prefix=None,
+    label_extra=None,
+) -> list[dict]:
+    """Shared search + multi-select UI over catalog items.
+
+    ``noun`` names the item type (e.g. 'learning path'). ``label_prefix`` is an
+    optional callable item -> str shown before each title (e.g. a course
+    number); ``label_extra`` is appended after each title (e.g. scope hints).
+    Returns the selected item dicts, or [] if the user cancels.
+    """
+
+    def _label(it: dict) -> str:
+        prefix = label_prefix(it) if label_prefix else ""
+        prefix = f"{prefix} — " if prefix else ""
+        extra = f"  ({label_extra(it)})" if label_extra else ""
+        return f"{prefix}{it.get('title', '(untitled)')}{extra}"
+
+    if not items:
+        print(f"\nNo {noun}s could be retrieved from the catalog.")
+        return []
 
     print()
-    print("Learning path picker")
+    print(f"{noun.capitalize()} picker")
     print("=" * 42)
-    print(f"{len(paths)} learning paths available.")
+    print(f"{len(items)} {noun}s available.")
 
     def _ask(prompt: str) -> str:
         try:
@@ -645,20 +708,20 @@ def pick_learning_paths(paths: list[dict]) -> tuple[list[str], str | None]:
 
     while True:
         term = _ask(
-            "\nSearch by keyword (e.g. 'azure fundamentals'), or Enter to list all: "
+            f"\nSearch by keyword (e.g. 'azure'), or Enter to list all {noun}s: "
         ).lower()
 
         if term:
             matches = [
-                lp for lp in paths
-                if term in (lp.get("title") or "").lower()
-                or term in (lp.get("summary") or "").lower()
+                it for it in items
+                if term in (it.get("title") or "").lower()
+                or term in (it.get("summary") or "").lower()
             ]
         else:
-            matches = paths
+            matches = items
 
         if not matches:
-            print(f"  No learning paths match '{term}'. Try another keyword.")
+            print(f"  No {noun}s match '{term}'. Try another keyword.")
             continue
 
         if len(matches) > PICKER_RESULT_LIMIT:
@@ -671,8 +734,8 @@ def pick_learning_paths(paths: list[dict]) -> tuple[list[str], str | None]:
             shown = matches
 
         print()
-        for idx, lp in enumerate(shown, 1):
-            print(f"  {idx:>3}  {lp.get('title', '(untitled)')}")
+        for idx, it in enumerate(shown, 1):
+            print(f"  {idx:>3}  {_label(it)}")
         print()
 
         choice = _ask(
@@ -682,7 +745,7 @@ def pick_learning_paths(paths: list[dict]) -> tuple[list[str], str | None]:
 
         if choice in ("q", "quit"):
             print("Cancelled.")
-            return [], None
+            return []
         if choice in ("", "s", "search"):
             continue
 
@@ -697,16 +760,105 @@ def pick_learning_paths(paths: list[dict]) -> tuple[list[str], str | None]:
             print("  No valid numbers in range — try again.")
             continue
 
-        urls = [lp["url"] for lp in selected if lp.get("url")]
-        if not urls:
-            print("  Selected paths have no usable URL — try again.")
-            continue
-
         print("\n-> Selected:")
-        for lp in selected:
-            print(f"     • {lp.get('title')}")
+        for it in selected:
+            print(f"     • {_label(it)}")
         print()
-        return urls, selected[0].get("title")
+        return selected
+
+
+def pick_learning_paths(
+    paths: list[dict],
+) -> tuple[list[dict], str | None, str | None]:
+    """Search & select learning paths.
+
+    Returns (targets, default title, suggested output basename). The basename is
+    None so the existing config/output naming is left untouched.
+    """
+    selected = _select_from_catalog(paths, noun="learning path")
+    targets = _as_path_targets([lp["url"] for lp in selected if lp.get("url")])
+    title = selected[0].get("title") if selected else None
+    return targets, title, None
+
+
+def pick_courses(
+    courses: list[dict],
+) -> tuple[list[dict], str | None, str | None]:
+    """Search & select courses. Expands each course's study_guide into targets.
+
+    Returns (targets, default title, suggested output basename). For a course
+    the title and filename are derived from its course number (e.g. MD-102T00),
+    falling back to a slug of the title when the number is missing. A single
+    course can expand to many learning paths/modules, so the scrape may be large.
+    """
+    selected = _select_from_catalog(
+        courses,
+        noun="course",
+        label_prefix=lambda c: c.get("course_number") or "",
+        label_extra=lambda c: f"{len(c.get('targets', []))} paths/modules",
+    )
+    targets: list[dict] = []
+    for course in selected:
+        targets.extend(course.get("targets", []))
+    if selected and not targets:
+        print("  Selected course(s) have no scrapeable content.")
+
+    if not selected:
+        return targets, None, None
+
+    first = selected[0]
+    number = (first.get("course_number") or "").strip()
+    raw_title = first.get("title") or "Course"
+    title = f"{number} — {raw_title}" if number else raw_title
+    basename = _slugify(number) if number else _slugify(raw_title)
+    return targets, title, basename
+
+
+def ask_source_interactively(config_paths: list[str], config_name: str) -> str:
+    """Ask where the learning content should come from.
+
+    Returns 'paths' (live learning paths), 'courses' (live courses), or
+    'config' (config YAML). The config option is only offered when the config
+    file actually contains paths.
+    """
+    has_config = bool(config_paths)
+    print()
+    print("Where should the content come from?")
+    print("=" * 42)
+    print("  1  ->  Live learning paths  (search & pick individual paths)")
+    print("  2  ->  Live courses         (exam-style, bundles paths, e.g. MD-102)")
+    if has_config:
+        print(f"  3  ->  Config file          ({config_name}, {len(config_paths)} path(s))")
+    else:
+        print(f"  3  ->  Config file          ({config_name} — no paths found)")
+    print()
+
+    while True:
+        try:
+            choice = input(
+                "Enter 1, 2 or 3 (or 'paths' / 'courses' / 'config'): "
+            ).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\nCancelled.")
+            raise SystemExit(0)
+
+        if choice in ("1", "paths", "path", "learningpaths"):
+            print("-> Source: live learning paths\n")
+            return "paths"
+        if choice in ("2", "courses", "course"):
+            print("-> Source: live courses\n")
+            return "courses"
+        if choice in ("3", "config", "yaml"):
+            if not has_config:
+                print(
+                    f"  No paths found in {config_name}. "
+                    "Choose 1 or 2 to use the live catalog."
+                )
+                continue
+            print(f"-> Source: config file ({config_name})\n")
+            return "config"
+
+        print("  Invalid choice — enter 1 (paths), 2 (courses) or 3 (config).")
 
 
 def ask_format_interactively() -> str:
@@ -766,13 +918,15 @@ def parse_args() -> argparse.Namespace:
         description=(
             "Microsoft Learn Scraper — downloads learning paths as Markdown, DOCX, TXT, or PDF.\n\n"
             "  --format is required. If omitted you will be prompted interactively.\n"
-            "  When no URLs are given, an interactive learning-path picker is shown."
+            "  When no URLs are given, a menu asks: live learning paths, live\n"
+            "  courses (e.g. MD-102), or the paths from config.yaml."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  python scrape_all_v2.py --format markdown            # pick path(s) interactively\n"
-            "  python scrape_all_v2.py --format pdf --pick           # force the picker\n"
+            "  python scrape_all_v2.py --format markdown            # source menu, then pick\n"
+            "  python scrape_all_v2.py --format pdf --pick           # force learning-path picker\n"
+            "  python scrape_all_v2.py --format pdf --courses        # force course picker\n"
             "  python scrape_all_v2.py --format docx --output MyCourse --urls URL\n"
             "  python scrape_all_v2.py --format txt --config other.yaml -v\n"
         ),
@@ -789,8 +943,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--pick",
         action="store_true",
-        help="Pick learning paths interactively from the Microsoft Learn catalog "
-             "(runs automatically when no URLs are provided)",
+        help="Skip the source menu and go straight to the live learning-path picker",
+    )
+    p.add_argument(
+        "--courses",
+        action="store_true",
+        help="Skip the source menu and go straight to the live course picker "
+             "(a course bundles several learning paths, e.g. MD-102)",
     )
     p.add_argument(
         "--locale",
@@ -824,27 +983,71 @@ def main() -> None:
 
     # ── Load config — CLI args take priority over YAML ────────────────────
     cfg = load_config(args.config)
-    urls = args.urls or cfg.get("paths", [])
+    config_paths = cfg.get("paths", [])
     title = args.title or cfg.get("title", "AZ-305 Course Material")
 
-    # ── No URLs (or --pick): let the user choose from the live catalog ────
-    if args.pick or not urls:
-        catalog = fetch_learning_paths(args.locale)
-        urls, picked_title = pick_learning_paths(catalog)
-        if not urls:
-            logger.info("No learning paths selected — nothing to do.")
-            raise SystemExit(0)
-        # Use the picked path's title as the document title unless one was set.
-        if not args.title and not cfg.get("title") and picked_title:
-            title = picked_title
+    # ── Decide where the content comes from ───────────────────────────────
+    #   --urls    : explicit CLI URLs always win, no prompt
+    #   --pick    : force the live learning-path picker
+    #   --courses : force the live course picker
+    #   otherwise : show a TUI menu (paths / courses / config YAML).
+    #               When stdin is not a TTY (cron/pipe) we can't prompt, so we
+    #               fall back to the config paths to preserve automation.
+    if args.urls:
+        source = "urls"
+    elif args.pick:
+        source = "paths"
+    elif args.courses:
+        source = "courses"
+    elif sys.stdin.isatty():
+        source = ask_source_interactively(config_paths, args.config)
+    else:
+        logger.info("Non-interactive session — using paths from %s.", args.config)
+        source = "config"
 
-    # Determine output filename — extension always follows the format
-    raw_output = args.output or cfg.get("output", "output")
+    picked_title: str | None = None
+    picked_output: str | None = None
+    if source == "urls":
+        targets = _as_path_targets(args.urls)
+    elif source == "paths":
+        targets, picked_title, picked_output = pick_learning_paths(
+            fetch_learning_paths(args.locale)
+        )
+    elif source == "courses":
+        targets, picked_title, picked_output = pick_courses(
+            fetch_courses(args.locale)
+        )
+    else:  # config
+        targets = _as_path_targets(config_paths)
+
+    if not targets:
+        if source == "config":
+            logger.error("No paths found in %s — nothing to do.", args.config)
+            raise SystemExit(1)
+        logger.info("Nothing selected — nothing to do.")
+        raise SystemExit(0)
+
+    # ── Document title ────────────────────────────────────────────────────
+    #   --title wins; then a picked course title (incl. its number) overrides
+    #   the config title; a picked path title only fills in when config has none.
+    if args.title:
+        pass
+    elif source == "courses" and picked_title:
+        title = picked_title
+    elif picked_title and not cfg.get("title"):
+        title = picked_title
+
+    # ── Output filename — extension always follows the format ─────────────
+    #   --output wins; then a course-derived name (e.g. MD-102T00); then config.
+    raw_output = args.output or picked_output or cfg.get("output", "output")
     output_path = Path(raw_output).with_suffix(FORMAT_EXTENSIONS[fmt])
+    if len(output_path.parts) == 1:
+        output_path = Path("exports") / output_path
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
     logger.info(
-        "Starting scraper — format: %s | %d learning paths | output: %s",
-        fmt, len(urls), output_path,
+        "Starting scraper — format: %s | %d target(s) | output: %s",
+        fmt, len(targets), output_path,
     )
 
     stats = ScrapeStats()
@@ -856,15 +1059,23 @@ def main() -> None:
         page = context.new_page()
 
         # Handle cookie banner on first navigation
-        if urls:
-            safe_goto(page, urls[0])
-            dismiss_cookie_banner(page)
+        safe_goto(page, targets[0]["url"])
+        dismiss_cookie_banner(page)
 
         results: list[LearningPath] = []
-        for url in urls:
-            lp = scrape_path(page, url, stats, seen_urls)
-            if lp and lp.modules:
-                results.append(lp)
+        for target in targets:
+            if target["kind"] == "module":
+                # A standalone module (from a course): wrap it in a one-module
+                # learning path so the writers keep their path → module → unit shape.
+                module = scrape_module(page, target["url"], stats, seen_urls)
+                if module and module.units:
+                    results.append(
+                        LearningPath(title=module.title, url=target["url"], modules=[module])
+                    )
+            else:
+                lp = scrape_path(page, target["url"], stats, seen_urls)
+                if lp and lp.modules:
+                    results.append(lp)
 
         browser.close()
 
